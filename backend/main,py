@@ -1,0 +1,456 @@
+import os
+import json
+import logging
+import re
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from google.cloud import aiplatform, translate, documentai
+from google.cloud import discoveryengine
+from google.api_core import client_options, exceptions
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional
+import requests
+
+# Initialize Flask app
+app = Flask(__name__)
+CORS(app)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Google Cloud Configuration
+PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "your-project-id")
+LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "asia-southeast1")
+DATA_STORE_ID = os.environ.get("VERTEX_AI_SEARCH_DATASTORE_ID", "your-datastore-id")
+
+# Initialize Google Cloud clients
+def initialize_clients():
+    try:
+        # Vertex AI Search client
+        search_client = discoveryengine.SearchServiceClient()
+        
+        # Cloud Translation client
+        translate_client = translate.TranslationServiceClient()
+        
+        # Document AI client
+        documentai_client = documentai.DocumentProcessorServiceClient()
+        
+        # Vertex AI for Gemini
+        aiplatform.init(project=PROJECT_ID, location=LOCATION)
+        
+        logger.info("All Google Cloud clients initialized successfully")
+        return search_client, translate_client, documentai_client
+    except Exception as e:
+        logger.error(f"Error initializing Google Cloud clients: {e}")
+        raise
+
+# Initialize clients
+try:
+    search_client, translate_client, documentai_client = initialize_clients()
+except Exception as e:
+    logger.warning(f"Could not initialize all clients: {e}")
+    search_client = translate_client = documentai_client = None
+
+# Government data sources
+GOVERNMENT_DATA_SOURCES = {
+    "myScheme": "https://www.myscheme.gov.in",
+    "NationalPortal": "https://www.india.gov.in",
+    "PIB": "https://pib.gov.in",
+    "eGazette": "https://egazette.gov.in",
+    "IndiaCode": "https://www.indiacode.nic.in",
+    "DataGov": "https://data.gov.in"
+}
+
+def query_vertex_ai_search(query: str, language: str = "en") -> Dict[str, Any]:
+    """Query Vertex AI Search with actual integration"""
+    if not search_client:
+        logger.error("Vertex AI Search client not initialized")
+        return {"results": []}
+    
+    try:
+        # Format the datastore name
+        datastore_name = f"projects/{PROJECT_ID}/locations/global/collections/default_collection/dataStores/{DATA_STORE_ID}"
+        
+        # Create search request
+        serving_config = f"{datastore_name}/servingConfigs/default_config"
+        
+        request = discoveryengine.SearchRequest(
+            serving_config=serving_config,
+            query=query,
+            page_size=5,
+            query_expansion_spec=discoveryengine.SearchRequest.QueryExpansionSpec(
+                condition=discoveryengine.SearchRequest.QueryExpansionSpec.Condition.AUTO
+            ),
+            spell_correction_spec=discoveryengine.SearchRequest.SpellCorrectionSpec(
+                mode=discoveryengine.SearchRequest.SpellCorrectionSpec.Mode.AUTO
+            ),
+        )
+        
+        # Execute search
+        response = search_client.search(request)
+        
+        # Process results
+        results = []
+        for result in response.results:
+            document = result.document
+            struct_data = document.derived_struct_data if document.derived_struct_data else {}
+            
+            result_data = {
+                "id": document.id,
+                "title": document.title if document.title else "No title",
+                "uri": document.uri if document.uri else "",
+                "snippet": struct_data.get("snippet", "No snippet available") if struct_data else "No content available",
+                "content": struct_data
+            }
+            results.append(result_data)
+        
+        return {
+            "summary": f"Found {len(results)} relevant results",
+            "results": results,
+            "total_size": response.total_size
+        }
+    
+    except exceptions.GoogleAPICallError as e:
+        logger.error(f"Google API call error: {e}")
+        return {"results": [], "error": str(e)}
+    except Exception as e:
+        logger.error(f"Error querying Vertex AI Search: {e}")
+        return {"results": [], "error": str(e)}
+
+def process_pdf_with_documentai(pdf_path: str) -> Dict[str, Any]:
+    """Process PDF using Document AI"""
+    if not documentai_client:
+        logger.error("Document AI client not initialized")
+        return {"content": "Document AI not configured"}
+    
+    try:
+        # For demo purposes, we'll use a sample processor
+        # In production, you would create and use a specific processor
+        processor_name = f"projects/{PROJECT_ID}/locations/{LOCATION}/processors/your-processor-id"
+        
+        # Read the PDF file
+        with open(pdf_path, "rb") as f:
+            pdf_content = f.read()
+        
+        # Create request
+        raw_document = documentai.RawDocument(
+            content=pdf_content,
+            mime_type="application/pdf"
+        )
+        
+        request = documentai.ProcessRequest(
+            name=processor_name,
+            raw_document=raw_document
+        )
+        
+        # Process document
+        result = documentai_client.process_document(request=request)
+        document = result.document
+        
+        return {
+            "text": document.text,
+            "entities": [{"type": entity.type_, "mention": entity.mention_text} for entity in document.entities],
+            "pages": len(document.pages)
+        }
+    
+    except Exception as e:
+        logger.error(f"Error processing PDF with Document AI: {e}")
+        return {"content": f"Error processing document: {str(e)}"}
+
+def translate_text(text: str, target_language: str = "hi") -> str:
+    """Translate text using Cloud Translation"""
+    if not translate_client:
+        logger.error("Translation client not initialized")
+        return text
+    
+    try:
+        if target_language == "en":
+            return text  # No translation needed for English
+        
+        location = "global"
+        parent = f"projects/{PROJECT_ID}/locations/{location}"
+        
+        response = translate_client.translate_text(
+            request={
+                "parent": parent,
+                "contents": [text],
+                "mime_type": "text/plain",
+                "source_language_code": "en",
+                "target_language_code": target_language,
+            }
+        )
+        
+        return response.translations[0].translated_text if response.translations else text
+    
+    except Exception as e:
+        logger.error(f"Error translating text: {e}")
+        return text
+
+def search_google_grounding(query: str) -> Dict[str, Any]:
+    """Search for latest information using Google Search Grounding"""
+    try:
+        # This would typically use the Vertex AI grounding feature
+        # For this implementation, we'll use a simplified approach
+        
+        # Search for government scheme updates
+        search_query = f"{query} site:gov.in OR site:nic.in OR site:myscheme.gov.in"
+        
+        # In a real implementation, you would use the Vertex AI grounding API
+        # For now, we'll return mock data with actual government URLs
+        
+        return {
+            "results": [
+                {
+                    "title": "PM-KISAN Latest Updates",
+                    "url": "https://pmkisan.gov.in",
+                    "snippet": "Latest updates to PM-KISAN scheme for farmers",
+                    "date": (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
+                },
+                {
+                    "title": "New Scholarship Schemes Announcement",
+                    "url": "https://www.myscheme.gov.in",
+                    "snippet": "Government announces new scholarship schemes for students",
+                    "date": (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
+                }
+            ],
+            "total_results": 2
+        }
+    
+    except Exception as e:
+        logger.error(f"Error in Google Search Grounding: {e}")
+        return {"results": [], "error": str(e)}
+
+def extract_scheme_info_from_text(text: str) -> Dict[str, Any]:
+    """Extract scheme information from text using pattern matching"""
+    # This is a simplified version - in production you would use more sophisticated NLP
+    patterns = {
+        "eligibility": [r"eligibility.*?:(.*?)(?=benefits|required|how to|$)", 
+                        r"eligible.*?:(.*?)(?=benefits|required|how to|$)"],
+        "benefits": [r"benefits.*?:(.*?)(?=eligibility|required|how to|$)",
+                     r"benefit.*?:(.*?)(?=eligibility|required|how to|$)"],
+        "documents": [r"documents.*?:(.*?)(?=eligibility|benefits|how to|$)",
+                      r"required.*?:(.*?)(?=eligibility|benefits|how to|$)"],
+        "application": [r"application.*?:(.*?)(?=eligibility|benefits|required|$)",
+                        r"how to apply.*?:(.*?)(?=eligibility|benefits|required|$)"]
+    }
+    
+    result = {}
+    for key, regex_list in patterns.items():
+        for regex in regex_list:
+            match = re.search(regex, text, re.IGNORECASE | re.DOTALL)
+            if match:
+                result[key] = match.group(1).strip()
+                break
+    
+    return result
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    clients_status = {
+        "vertex_ai_search": search_client is not None,
+        "translation": translate_client is not None,
+        "document_ai": documentai_client is not None
+    }
+    
+    return jsonify({
+        "status": "healthy", 
+        "service": "AI Scheme Assistant API", 
+        "timestamp": datetime.now().isoformat(),
+        "clients": clients_status
+    })
+
+@app.route('/chat', methods=['POST'])
+def chat_endpoint():
+    try:
+        data = request.get_json()
+        user_message = data.get('message', '')
+        language = data.get('language', 'en')
+        use_grounding = data.get('use_grounding', False)
+        
+        if not user_message:
+            return jsonify({"error": "Message is required"}), 400
+        
+        logger.info(f"Received query: {user_message} in language: {language}")
+        
+        # Query Vertex AI Search
+        search_results = query_vertex_ai_search(user_message, language)
+        
+        # If grounding is requested or no results found, use Google Search Grounding
+        grounding_results = None
+        if use_grounding or not search_results.get('results'):
+            grounding_results = search_google_grounding(user_message)
+        
+        # Process results and generate response
+        response = generate_structured_response(
+            user_message, 
+            search_results, 
+            grounding_results, 
+            language
+        )
+        
+        return jsonify(response)
+    
+    except Exception as e:
+        logger.error(f"Error in chat endpoint: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route('/process-pdf', methods=['POST'])
+def process_pdf_endpoint():
+    try:
+        # In a real implementation, you would receive the PDF file
+        # For demo purposes, we'll use a sample PDF path
+        pdf_url = request.json.get('pdf_url', '')
+        
+        if not pdf_url:
+            return jsonify({"error": "PDF URL is required"}), 400
+        
+        # Download PDF (simplified)
+        # In production, you would handle file uploads properly
+        pdf_path = f"/tmp/{pdf_url.split('/')[-1]}"
+        
+        # Process PDF with Document AI
+        result = process_pdf_with_documentai(pdf_path)
+        
+        # Extract scheme information
+        scheme_info = extract_scheme_info_from_text(result.get('text', ''))
+        
+        return jsonify({
+            "processing_result": result,
+            "extracted_info": scheme_info,
+            "source": pdf_url
+        })
+    
+    except Exception as e:
+        logger.error(f"Error in PDF processing endpoint: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+def generate_structured_response(query: str, search_results: Dict[str, Any], 
+                                grounding_results: Optional[Dict[str, Any]], 
+                                language: str) -> Dict[str, Any]:
+    """Generate a structured response based on search results"""
+    results = search_results.get('results', [])
+    grounding_data = grounding_results.get('results', []) if grounding_results else []
+    
+    if not results and not grounding_data:
+        return create_empty_response(query, language)
+    
+    # For demo purposes, use the first result
+    # In production, you would use an LLM to synthesize multiple results
+    primary_result = results[0] if results else None
+    grounding_result = grounding_data[0] if grounding_data else None
+    
+    # Extract information from search result
+    scheme_name = primary_result.get('title', 'Unknown Scheme') if primary_result else "Government Scheme"
+    content = primary_result.get('snippet', '') if primary_result else ""
+    uri = primary_result.get('uri', '') if primary_result else ""
+    
+    # Extract structured information
+    extracted_info = extract_scheme_info_from_text(content)
+    
+    # Build response schema
+    response_schema = {
+        "query_language": language,
+        "scheme_name": scheme_name,
+        "issuer": "Central",  # Would be extracted from content in production
+        "state": "All-India",  # Would be extracted from content in production
+        "category": ["General"],  # Would be extracted from content in production
+        "eligibility_summary": extracted_info.get('eligibility', 'Eligibility criteria not specified'),
+        "benefits_summary": extracted_info.get('benefits', 'Benefits not specified'),
+        "required_documents": extracted_info.get('documents', 'Documents required not specified').split(',') 
+                             if isinstance(extracted_info.get('documents'), str) else [],
+        "how_to_apply": {
+            "mode": ["Online", "Offline"],  # Would be extracted from content in production
+            "official_portal": uri if uri else "https://www.myscheme.gov.in",
+            "steps": extracted_info.get('application', 'Application process not specified').split('.') 
+                    if isinstance(extracted_info.get('application'), str) else [],
+            "deadline": "Ongoing"  # Would be extracted from content in production
+        },
+        "latest_updates": grounding_result.get('snippet', 'No recent updates found') if grounding_result else 'No recent updates found',
+        "sources": [
+            {"title": scheme_name, "url": uri, "type": "primary"} if uri else 
+            {"title": "myScheme", "url": "https://www.myscheme.gov.in", "type": "primary"}
+        ],
+        "last_checked": datetime.now().strftime("%Y-%m-%d"),
+        "confidence": 0.7 if primary_result else 0.4,
+        "disclaimer": "This is an AI assistant; verify on official portals. Information may not be up to date."
+    }
+    
+    # Add grounding sources if available
+    if grounding_result:
+        response_schema["sources"].append({
+            "title": grounding_result.get('title', 'Latest Update'),
+            "url": grounding_result.get('url', ''),
+            "type": "update"
+        })
+    
+    # Generate text response
+    text_response = generate_text_response(response_schema, query)
+    
+    # Translate if needed
+    if language != 'en':
+        text_response = translate_text(text_response, language)
+        response_schema['eligibility_summary'] = translate_text(response_schema['eligibility_summary'], language)
+        response_schema['benefits_summary'] = translate_text(response_schema['benefits_summary'], language)
+    
+    return {
+        "text_response": text_response,
+        **response_schema
+    }
+
+def generate_text_response(schema: Dict[str, Any], query: str) -> str:
+    """Generate human-readable text response from structured data"""
+    return f"""
+Based on your query about "{query}", I found information about the {schema['scheme_name']} scheme.
+
+**Eligibility**: {schema['eligibility_summary']}
+
+**Benefits**: {schema['benefits_summary']}
+
+**Required Documents**: {', '.join(schema['required_documents']) if schema['required_documents'] else 'Not specified'}
+
+**How to Apply**: 
+{'. '.join(schema['how_to_apply']['steps']) if schema['how_to_apply']['steps'] else 'Visit the official portal for application details'}
+
+**Latest Updates**: {schema['latest_updates']}
+
+Visit the official portal for more details: {schema['how_to_apply']['official_portal']}
+
+*Please note: This information should be verified on official government portals.*
+""".strip()
+
+def create_empty_response(query: str, language: str) -> Dict[str, Any]:
+    """Create a response when no results are found"""
+    text_response = f"I couldn't find any relevant schemes for your query about '{query}'. Please try rephrasing or ask about specific categories like farmer schemes, health schemes, or education schemes."
+    
+    if language != 'en':
+        text_response = translate_text(text_response, language)
+    
+    return {
+        "text_response": text_response,
+        "query_language": language,
+        "scheme_name": "No schemes found",
+        "issuer": "N/A",
+        "state": "N/A",
+        "category": [],
+        "eligibility_summary": "N/A",
+        "benefits_summary": "N/A",
+        "required_documents": [],
+        "how_to_apply": {
+            "mode": [],
+            "official_portal": "https://www.myscheme.gov.in",
+            "steps": ["Visit the myScheme portal to browse all available schemes"],
+            "deadline": ""
+        },
+        "latest_updates": "No relevant schemes found for your query",
+        "sources": [
+            {"title": "myScheme", "url": "https://www.myscheme.gov.in", "type": "primary"}
+        ],
+        "last_checked": datetime.now().strftime("%Y-%m-%d"),
+        "confidence": 0.1,
+        "disclaimer": "This is an AI assistant; verify on official portals."
+    }
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8080))
+    app.run(debug=True, host='0.0.0.0', port=port)
